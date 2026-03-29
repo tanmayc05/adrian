@@ -36,14 +36,18 @@ def run():
             pass
         print("  Invalid selection. Enter numbers separated by commas.")
 
+    # Location
+    location = input("\nYour location (e.g. New York, US): ").strip()
+
     # Save
-    add_subscriber(phone, selected)
-    print(f"\nRegistered {phone} for: {', '.join(selected)}")
+    add_subscriber(phone, selected, location)
+    print(f"\nRegistered {phone} for: {', '.join(selected)} | location: {location or '(none)'}")
 
     # Show all subscribers
     print("\n--- All subscribers ---")
     for s in get_all_subscribers():
-        print(f"  {s['phone']} -> {', '.join(s['categories'])}")
+        loc = f" | {s['location']}" if s.get('location') else ""
+        print(f"  {s['phone']} -> {', '.join(s['categories'])}{loc}")
 
 
 if __name__ == "__main__":

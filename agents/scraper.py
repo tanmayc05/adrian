@@ -43,7 +43,11 @@ def fetch_reddit_deals(limit_per_sub: int = 25) -> list[dict]:
     all_deals = []
     cutoff = time.time() - (MAX_AGE_HOURS * 3600)
 
-    for subreddit in SUBREDDITS:
+    for i, subreddit in enumerate(SUBREDDITS):
+        # Rate limit: 2s between requests to stay under Reddit's limits
+        if i > 0:
+            time.sleep(2)
+
         query = SEARCH_QUERIES.get(subreddit, "deal discount coupon")
         url = f"https://www.reddit.com/r/{subreddit}/search.json"
         params = {"q": query, "sort": "new", "limit": limit_per_sub, "restrict_sr": "on"}
@@ -82,14 +86,40 @@ def fetch_reddit_deals(limit_per_sub: int = 25) -> list[dict]:
     return all_deals
 
 
-X_SEARCH_QUERIES = [
-    "food deal OR promo OR coupon OR BOGO OR discount",
-    "UberEats promo code OR coupon OR free delivery",
-    "DoorDash promo code OR coupon OR deal",
-    "GrubHub promo code OR coupon OR deal",
-    "restaurant deal OR coupon OR special OR BOGO",
-    "fast food deal OR free OR coupon OR app offer",
+# --- Brand account queries (highest priority, no min_faves needed) ---
+# Split into 3 groups to stay under X's ~30 OR operator limit per query
+X_BRAND_QUERIES = [
+    # Group 1: Delivery apps + fast food
+    "from:UberEats OR from:DoorDash OR from:Grubhub OR from:Instacart OR from:Seamless OR from:Postmates "
+    "OR from:McDonalds OR from:BurgerKing OR from:Wendys OR from:Arbys OR from:tacobell "
+    "OR from:jackinthebox OR from:Whataburger OR from:SonicDriveIn OR from:CarlsJr OR from:hardees",
+    # Group 2: Pizza + fast casual
+    "from:Dominos OR from:pizzahut OR from:PapaJohns OR from:littlecaesars OR from:MarcosPizza "
+    "OR from:Chipotle OR from:qdoba OR from:Moes_HQ OR from:PandaExpress OR from:Wingstop "
+    "OR from:raising_canes OR from:ChickfilA OR from:PopeyesChicken OR from:churchschicken",
+    # Group 3: Coffee/breakfast + subs/sandwiches + other
+    "from:Starbucks OR from:DunkinUS OR from:TimHortons "
+    "OR from:SUBWAY OR from:jimmyjohns OR from:JerseyMikes OR from:firehouse_subs OR from:potbelly "
+    "OR from:DairyQueen OR from:BaskinRobbins OR from:Jamba OR from:Cinnabon OR from:auntieannes",
 ]
+
+# Common gambling/betting spam terms to exclude from all keyword queries
+_BET_EXCLUDE = "-bet -betting -1xbet -odds -casino -DraftKings -FanDuel -wager -sportsbook -parlay"
+
+# --- Keyword searches (lower priority, use advanced filters to cut noise) ---
+# Trimmed to 7 queries that actually produce fresh results (avoids X throttling)
+X_KEYWORD_QUERIES = [
+    f'"promo code" OR "discount code" (food OR restaurant OR delivery) lang:en -filter:replies min_faves:5 {_BET_EXCLUDE}',
+    f'"BOGO" OR "buy one get one" (restaurant OR food) lang:en -filter:replies min_faves:10 {_BET_EXCLUDE}',
+    f'(UberEats OR DoorDash) "promo code" lang:en -filter:replies {_BET_EXCLUDE}',
+    f'"free delivery" OR "free food" (restaurant OR app) lang:en -filter:replies min_faves:15 {_BET_EXCLUDE}',
+    f'"use code" (food OR delivery OR restaurant OR UberEats OR DoorDash) lang:en -filter:replies min_faves:5 {_BET_EXCLUDE}',
+    f'"promo code:" (food OR restaurant OR delivery) lang:en -filter:replies min_faves:3 {_BET_EXCLUDE}',
+    f'#fooddeals OR #restaurantdeals OR #fastfooddeals lang:en -filter:replies min_faves:5 {_BET_EXCLUDE}',
+]
+
+# Brand queries run first, then keyword queries
+X_SEARCH_QUERIES = X_BRAND_QUERIES + X_KEYWORD_QUERIES
 
 
 def _parse_cookies(cookies_str: str) -> list[dict]:
@@ -103,41 +133,9 @@ def _parse_cookies(cookies_str: str) -> list[dict]:
     return cookies
 
 
-def _scrape_x_search(query: str, cookies: list[dict], timeout_ms: int = 30000) -> list[dict]:
-    """Use Playwright to search X and intercept the API response."""
-    from playwright.sync_api import sync_playwright
-
+def _parse_tweets(api_data: dict) -> list[dict]:
+    """Parse tweets from an X SearchTimeline API response."""
     tweets = []
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-        )
-        context.add_cookies(cookies)
-
-        page = context.new_page()
-
-        encoded_query = requests.utils.quote(query)
-        url = f"https://x.com/search?q={encoded_query}&src=typed_query&f=live"
-
-        # Navigate and wait for the SearchTimeline API response
-        try:
-            with page.expect_response(
-                lambda r: "SearchTimeline" in r.url and r.status == 200,
-                timeout=timeout_ms,
-            ) as response_info:
-                page.goto(url, timeout=timeout_ms)
-
-            api_data = response_info.value.json()
-        except Exception as e:
-            logger.warning(f"X: no SearchTimeline response for '{query[:30]}' — {e}")
-            browser.close()
-            return []
-
-        browser.close()
-
-    # Parse the API response
     try:
         instructions = api_data["data"]["search_by_raw_query"]["search_timeline"]["timeline"]["instructions"]
         for instruction in instructions:
@@ -158,6 +156,11 @@ def _scrape_x_search(query: str, cookies: list[dict], timeout_ms: int = 30000) -
                     if not text or not tweet_id:
                         continue
 
+                    # Skip replies (customer support noise) — replies start with @
+                    in_reply_to = legacy.get("in_reply_to_status_id_str")
+                    if in_reply_to:
+                        continue
+
                     created_dt = datetime.strptime(created_str, "%a %b %d %H:%M:%S %z %Y")
                     created_utc = created_dt.timestamp()
 
@@ -172,12 +175,33 @@ def _scrape_x_search(query: str, cookies: list[dict], timeout_ms: int = 30000) -
                     continue
     except (KeyError, TypeError):
         pass
-
     return tweets
 
 
+def _scrape_x_search(query: str, page, timeout_ms: int = 30000) -> list[dict]:
+    """Run a single X search query using an existing Playwright page."""
+    encoded_query = requests.utils.quote(query)
+    url = f"https://x.com/search?q={encoded_query}&src=typed_query&f=live"
+
+    try:
+        with page.expect_response(
+            lambda r: "SearchTimeline" in r.url and r.status == 200,
+            timeout=timeout_ms,
+        ) as response_info:
+            page.goto(url, timeout=timeout_ms)
+
+        api_data = response_info.value.json()
+    except Exception as e:
+        logger.warning(f"X: no SearchTimeline response for '{query[:30]}' — {e}")
+        return []
+
+    return _parse_tweets(api_data)
+
+
 def fetch_x_deals(limit_per_query: int = 20) -> list[dict]:
-    """Fetch deals from X using Playwright to drive a real browser."""
+    """Fetch deals from X using a single Playwright browser session for all queries."""
+    from playwright.sync_api import sync_playwright
+
     cookies_str = os.getenv("X_COOKIES", "")
     if not cookies_str:
         logger.error("X_COOKIES missing from .env")
@@ -185,35 +209,55 @@ def fetch_x_deals(limit_per_query: int = 20) -> list[dict]:
 
     cookies = _parse_cookies(cookies_str)
     all_deals = []
+    seen_ids = set()
     cutoff = time.time() - (MAX_AGE_HOURS * 3600)
+    dupes_skipped = 0
 
-    for query in X_SEARCH_QUERIES:
-        try:
-            tweets = _scrape_x_search(query, cookies)
-            fresh = 0
-            for tweet in tweets:
-                if tweet["created_utc"] < cutoff:
-                    continue
-                fresh += 1
-                age_hours = (time.time() - tweet["created_utc"]) / 3600
-                all_deals.append({
-                    "id": tweet["id"],
-                    "title": tweet["text"][:200],
-                    "body": tweet["text"],
-                    "url": tweet["url"],
-                    "source": "twitter",
-                    "subreddit": "",
-                    "created_utc": tweet["created_utc"],
-                    "age_hours": round(age_hours, 1),
-                })
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+        )
+        context.add_cookies(cookies)
+        page = context.new_page()
 
-            logger.info(f"X query '{query[:40]}...': {fresh}/{len(tweets)} within {MAX_AGE_HOURS}h")
+        for i, query in enumerate(X_SEARCH_QUERIES):
+            # Rate limit: 5s between queries to avoid X throttling
+            if i > 0:
+                time.sleep(5)
 
-        except Exception as e:
-            logger.error(f"X query '{query[:40]}...': failed — {e}")
-            continue
+            try:
+                tweets = _scrape_x_search(query, page)
+                fresh = 0
+                for tweet in tweets:
+                    if tweet["id"] in seen_ids:
+                        dupes_skipped += 1
+                        continue
+                    if tweet["created_utc"] < cutoff:
+                        continue
+                    seen_ids.add(tweet["id"])
+                    fresh += 1
+                    age_hours = (time.time() - tweet["created_utc"]) / 3600
+                    all_deals.append({
+                        "id": tweet["id"],
+                        "title": tweet["text"][:200],
+                        "body": tweet["text"],
+                        "url": tweet["url"],
+                        "source": "twitter",
+                        "subreddit": "",
+                        "created_utc": tweet["created_utc"],
+                        "age_hours": round(age_hours, 1),
+                    })
 
-    logger.info(f"X total: {len(all_deals)} fresh deals")
+                logger.info(f"X query '{query[:40]}...': {fresh}/{len(tweets)} within {MAX_AGE_HOURS}h")
+
+            except Exception as e:
+                logger.error(f"X query '{query[:40]}...': failed — {e}")
+                continue
+
+        browser.close()
+
+    logger.info(f"X total: {len(all_deals)} fresh deals ({dupes_skipped} dupes skipped)")
     return all_deals
 
 
